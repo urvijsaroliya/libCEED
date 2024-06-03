@@ -1,3 +1,20 @@
+// ---------------------------------------------------------------------
+//
+// Copyright (C) 2023 by the deal.II authors
+//
+// This file is part of the deal.II library.
+//
+// The deal.II library is free software; you can use it, redistribute
+// it, and/or modify it under the terms of the GNU Lesser General
+// Public License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+// The full text of the license can be found in the file LICENSE.md at
+// the top level directory of deal.II.
+//
+//  Authors: Peter Munch, Martin Kronbichler
+//
+// ---------------------------------------------------------------------
+
 // deal.II includes
 #include <deal.II/dofs/dof_tools.h>
 
@@ -77,9 +94,9 @@ public:
     , constraints(constraints)
     , quadrature(quadrature)
     , resource(resource)
-    {
-        reinit();
-    }
+  {
+    reinit();
+  }
 
   /**
    * Destructor.
@@ -99,21 +116,13 @@ public:
   /**
    * Initialized internal data structures, particularly, libCEED.
    */
-  void reinit() override
+  void
+  reinit() override
   {
     const auto &tria = dof_handler.get_triangulation();
     const auto &fe   = dof_handler.get_fe();
 
     const auto n_components = fe.n_components();
-
-    if (bp == BPType::BP1 || bp == BPType::BP3 || bp == BPType::BP5)
-      {
-        AssertThrow(n_components == 1, ExcInternalError());
-      }
-    else
-      {
-        AssertThrow(n_components == dim, ExcInternalError());
-      }
 
     // 1) create CEED instance -> "MatrixFree"
     const char *ceed_spec = resource.c_str();
@@ -168,9 +177,9 @@ public:
                               &sol_restriction);
 
     // 4) create mapping -> MappingInfo
-    const unsigned int n_components_metric = (bp <= BPType::BP2) ? 1 : (dim * (dim + 1) / 2);
+    const unsigned int n_components_metric = (dim * (dim + 1) / 2);
 
-    this->weights = compute_metric_data(ceed, mapping, tria, quadrature, bp);
+    this->weights = compute_metric_data(ceed, mapping, tria, quadrature);
 
     strides = {{1,
                 static_cast<int>(quadrature.size()),
@@ -193,28 +202,14 @@ public:
       build_ctx, CEED_MEM_HOST, CEED_USE_POINTER, sizeof(build_ctx_data), &build_ctx_data);
 
     // 5) create q operation
-    if (bp == BPType::BP1)
-      CeedQFunctionCreateInterior(ceed, 1, f_apply_mass, f_apply_mass_loc, &qf_apply);
-    else if (bp == BPType::BP2)
-      CeedQFunctionCreateInterior(ceed, 1, f_apply_mass_vec, f_apply_mass_vec_loc, &qf_apply);
-    else if (bp == BPType::BP3 || bp == BPType::BP5)
-      CeedQFunctionCreateInterior(ceed, 1, f_apply_poisson, f_apply_poisson_loc, &qf_apply);
-    else if (bp == BPType::BP4 || bp == BPType::BP6)
-      CeedQFunctionCreateInterior(ceed, 1, f_apply_poisson_vec, f_apply_poisson_vec_loc, &qf_apply);
-    else
-      AssertThrow(false, ExcInternalError());
-
-    if (bp <= BPType::BP2)
-      CeedQFunctionAddInput(qf_apply, "u", n_components, CEED_EVAL_INTERP);
-    else
-      CeedQFunctionAddInput(qf_apply, "u", dim * n_components, CEED_EVAL_GRAD);
+    CeedQFunctionCreateInterior(ceed, 1, f_apply_poisson, f_apply_poisson_loc, &qf_apply);
+    // CeedQFunctionCreateInterior(ceed, 1, f_apply_poisson_vec, f_apply_poisson_vec_loc, &qf_apply);
+    
+    CeedQFunctionAddInput(qf_apply, "u", dim * n_components, CEED_EVAL_GRAD);
 
     CeedQFunctionAddInput(qf_apply, "qdata", n_components_metric, CEED_EVAL_NONE);
 
-    if (bp <= BPType::BP2)
-      CeedQFunctionAddOutput(qf_apply, "v", n_components, CEED_EVAL_INTERP);
-    else
-      CeedQFunctionAddOutput(qf_apply, "v", dim * n_components, CEED_EVAL_GRAD);
+    CeedQFunctionAddOutput(qf_apply, "v", dim * n_components, CEED_EVAL_GRAD);
 
     CeedQFunctionSetContext(qf_apply, build_ctx);
 
@@ -409,8 +404,7 @@ private:
   compute_metric_data(const Ceed               &ceed,
                       const Mapping<dim>       &mapping,
                       const Triangulation<dim> &tria,
-                      const Quadrature<dim>    &quadrature,
-                      const BPType              bp)
+                      const Quadrature<dim>    &quadrature)
   {
     std::vector<double> weights;
 
@@ -442,7 +436,7 @@ private:
 
     const unsigned int n_q_points = quadrature.get_tensor_basis()[0].size();
 
-    const unsigned int n_components = (bp <= BPType::BP2) ? 1 : (dim * (dim + 1) / 2);
+    const unsigned int n_components = (dim * (dim + 1) / 2);
 
     const auto mapping_q = dynamic_cast<const MappingQ<dim> *>(&mapping);
 
@@ -546,10 +540,7 @@ private:
       build_ctx, CEED_MEM_HOST, CEED_USE_POINTER, sizeof(build_ctx_data), &build_ctx_data);
 
     // 5) create q operation
-    if (bp <= BPType::BP2)
-      CeedQFunctionCreateInterior(ceed, 1, f_build_mass, f_build_mass_loc, &qf_build);
-    else
-      CeedQFunctionCreateInterior(ceed, 1, f_build_poisson, f_build_poisson_loc, &qf_build);
+    CeedQFunctionCreateInterior(ceed, 1, f_build_poisson, f_build_poisson_loc, &qf_build);
 
     CeedQFunctionAddInput(qf_build, "geo", dim * dim, CEED_EVAL_GRAD);
     CeedQFunctionAddInput(qf_build, "weights", 1, CEED_EVAL_WEIGHT);
@@ -600,11 +591,6 @@ private:
   const Quadrature<dim> &quadrature;
 
   /**
-   * Selected BP.
-   */
-  const BPType bp;
-
-  /**
    * Resource name.
    */
   const std::string resource;
@@ -639,3 +625,163 @@ private:
 };
 
 
+
+template <int dim, typename Number>
+class OperatorDealii : public OperatorBase<Number>
+{
+public:
+  using VectorType = typename OperatorBase<Number>::VectorType;
+
+  /**
+   * Constructor.
+   */
+  OperatorDealii(const Mapping<dim>              &mapping,
+                 const DoFHandler<dim>           &dof_handler,
+                 const AffineConstraints<Number> &constraints,
+                 const Quadrature<dim>           &quadrature)
+    : mapping(mapping)
+    , dof_handler(dof_handler)
+    , constraints(constraints)
+    , quadrature(quadrature)
+  {
+    reinit();
+  }
+
+  /**
+   * Destructor.
+   */
+  ~OperatorDealii() = default;
+
+  /**
+   * Initialized internal data structures, particularly, MatrixFree.
+   */
+  void
+  reinit() override
+  {
+    // configure MatrixFree
+    typename MatrixFree<dim, Number>::AdditionalData additional_data;
+    additional_data.tasks_parallel_scheme =
+      MatrixFree<dim, Number>::AdditionalData::TasksParallelScheme::none;
+    additional_data.mapping_update_flags =
+          (update_gradients | update_JxW_values | update_quadrature_points);
+
+    // create MatrixFree
+    matrix_free.reinit(mapping, dof_handler, constraints, quadrature, additional_data);
+  }
+
+  /**
+   * Matrix-vector product.
+   */
+  void
+  vmult(VectorType &dst, const VectorType &src) const override
+  {
+    if (dof_handler.get_fe().n_components() == 1)
+      {
+        matrix_free.cell_loop(&OperatorDealii::do_cell_integral_range<1>, this, dst, src, true);
+      }
+    else
+      {
+        AssertThrow(dof_handler.get_fe().n_components() == dim, ExcInternalError());
+
+        matrix_free.cell_loop(&OperatorDealii::do_cell_integral_range<dim>, this, dst, src, true);
+      }
+  }
+
+  /**
+   * Initialize vector.
+   */
+  void
+  initialize_dof_vector(VectorType &vec) const override
+  {
+    matrix_free.initialize_dof_vector(vec);
+  }
+
+  /**
+   * Compute inverse of diagonal.
+   */
+  void
+  compute_inverse_diagonal(VectorType &diagonal) const override
+  {
+    this->initialize_dof_vector(diagonal);
+
+    if (dof_handler.get_fe().n_components() == 1)
+      {
+        MatrixFreeTools::compute_diagonal(matrix_free,
+                                          diagonal,
+                                          &OperatorDealii::do_cell_integral_local<1>,
+                                          this);
+      }
+    else
+      {
+        AssertThrow(dof_handler.get_fe().n_components() == dim, ExcInternalError());
+
+        MatrixFreeTools::compute_diagonal(matrix_free,
+                                          diagonal,
+                                          &OperatorDealii::do_cell_integral_local<dim>,
+                                          this);
+      }
+
+    for (auto &i : diagonal)
+      i = (std::abs(i) > 1.0e-10) ? (1.0 / i) : 1.0;
+  }
+
+private:
+  /**
+   * Cell integral without vector access.
+   */
+  template <int n_components>
+  void
+  do_cell_integral_local(FEEvaluation<dim, -1, 0, n_components, Number> &phi) const
+  {
+    phi.evaluate(EvaluationFlags::gradients);
+    for (const auto q : phi.quadrature_point_indices())
+      phi.submit_gradient(phi.get_gradient(q), q);
+    phi.integrate(EvaluationFlags::gradients);
+  }
+
+  /**
+   * Cell integral on a range of cells.
+   */
+  template <int n_components>
+  void
+  do_cell_integral_range(const MatrixFree<dim, Number>               &matrix_free,
+                         VectorType                                  &dst,
+                         const VectorType                            &src,
+                         const std::pair<unsigned int, unsigned int> &range) const
+  {
+    FEEvaluation<dim, -1, 0, n_components, Number> phi(matrix_free, range);
+
+    for (unsigned cell = range.first; cell < range.second; ++cell)
+      {
+        phi.reinit(cell);
+        phi.read_dof_values(src);            // read source vector
+        do_cell_integral_local(phi);         // cell integral
+        phi.distribute_local_to_global(dst); // write to destination vector
+      }
+  }
+
+  /**
+   * Mapping object passed to the constructor.
+   */
+  const Mapping<dim> &mapping;
+
+  /**
+   * DoFHandler object passed to the constructor.
+   */
+  const DoFHandler<dim> &dof_handler;
+
+  /**
+   * Constraints object passed to the constructor.
+   */
+  const AffineConstraints<Number> &constraints;
+
+  /**
+   * Quadrature rule object passed to the constructor.
+   */
+  const Quadrature<dim> &quadrature;
+
+  /**
+   * MatrixFree object.
+   */
+  MatrixFree<dim, Number> matrix_free;
+};

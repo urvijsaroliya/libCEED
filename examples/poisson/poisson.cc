@@ -1,3 +1,20 @@
+// ---------------------------------------------------------------------
+//
+// Copyright (C) 2023 by the deal.II authors
+//
+// This file is part of the deal.II library.
+//
+// The deal.II library is free software; you can use it, redistribute
+// it, and/or modify it under the terms of the GNU Lesser General
+// Public License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+// The full text of the license can be found in the file LICENSE.md at
+// the top level directory of deal.II.
+//
+//  Authors: Peter Munch, Martin Kronbichler
+//
+// ---------------------------------------------------------------------
+
 // deal.II includes
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/mpi.h>
@@ -17,6 +34,8 @@
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/mapping_q1.h>
 
+#include <deal.II/numerics/vector_tools.h>
+
 #include <deal.II/grid/grid_generator.h>
 
 #include <deal.II/lac/affine_constraints.h>
@@ -28,76 +47,101 @@
 
 #include <sstream>
 
-template <int dim> LaplaceProblem<dim>::LaplaceProblem()
-#ifdef DEAL_II_WITH_P4EST
-    : triangulation(MPI_COMM_WORLD,
-                    Triangulation<dim>::limit_level_difference_at_vertices,
-                    parallel::distributed::Triangulation<
-                      dim>::construct_multigrid_hierarchy)
-#else
-    : triangulation(Triangulation<dim>::limit_level_difference_at_vertices)
-#endif
-    , fe(degree_finite_element)
-    , dof_handler(triangulation)
-    , setup_time(0.)
-    , pcout(std::cout, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
-    // The LaplaceProblem class holds an additional output stream that
-    // collects detailed timings about the setup phase. This stream, called
-    // time_details, is disabled by default through the @p false argument
-    // specified here. For detailed timings, removing the @p false argument
-    // prints all the details.
-    , time_details(std::cout,
-                   false &&
-                     Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
-  {}
-
+// include operators
+#include "poisson.h"
 
 int main(int argc, char *argv[])
 {
-    Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
-    ConditionalOStream pcout(std::cout, Utilities::MPI::this_mpi_proces (MPI_COMM_WORLD) == 0);
-    using Number                     = double;
-    using VectorType                 = LinearAlgebra::distributed::Vector<Number>;
-    
-    // !To set
-    const unsigned int dim           = 3;
-    const unsigned int fe_degree     = 2;
-    // To set!
+  Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
+  ConditionalOStream pout(std::cout, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0);
 
-    const unsigned int n_vect_doubles = LinearAlgebra::distributed::Vector<Number>::size();
-    const unsigned int n_vect_bits    = 8 * sizeof(Number) * n_vect_doubles;
+  // Init parameters
+  using Number                     = double;
+  using VectorType                 = LinearAlgebra::distributed::Vector<Number>;
+  const unsigned int dim           = 3;
+  const unsigned int fe_degree     = 2;
+  const unsigned int n_q_points    = fe_degree + 1;
+  const unsigned int n_components  = 1;
+  std::string  libCEED_resource    = "/cpu/self/avx/blocked";
 
-    pcout << "Vectorization over " << n_vect_doubles << " doubles = " << n_vect_bits << " bits (" << Utilities::System::get_current_vectorization_level() << ')' << std::endl;
+#ifdef DEAL_II_WITH_P4EST
+  parallel::distributed::Triangulation<dim> tria(MPI_COMM_WORLD);
+#else
+  parallel::shared::Triangulation<dim> tria(MPI_COMM_WORLD, ::Triangulation<dim>::none, true);
+#endif
 
-    const unsigned int n_q_points    = (bp <= BPType::BP4) ? (fe_degree + 2) : (fe_degree + 1);
-    const unsigned int n_refinements = 9 - dim;
-    const unsigned int n_components = 1;
+  // create mapping, quadrature, fe, mesh, ...
+  MappingQ1<dim> mapping;
+  QGauss<dim>    quadrature(n_q_points);
+  FESystem<dim>  fe(FE_Q<dim>(fe_degree), n_components);
+  DoFHandler<dim> dof_handler(tria);
+  AffineConstraints<Number> constraints;
 
-    #ifdef DEAL_II_WITH_P4EST
-        parallel::distributed::Triangulation<dim> tria(MPI_COMM_WORLD);
-    #else
-        parallel::shared::Triangulation<dim> tria(MPI_COMM_WORLD, ::Triangulation<dim>::none, true);
-    #endif
-    MappingQ1<dim> mapping;
-    QGauss<dim>    quadrature(n_q_points);
-    FESystem<dim>  fe(FE_Q<dim>(fe_degree), n_components);
-    DoFHandler<dim> dof_handler(tria);
-    AffineConstraints<Number> constraints;
-
-    for (unsigned int cycle = 0; cycle < 9 - dim; ++cycle)
+  for (unsigned int cycle = 0; cycle < 9 - dim; ++cycle)
+  {
+    pout << "Cycle " << cycle << std::endl;
+    if (cycle == 0)
     {
-        pcout << "Cycle " << cycle << std::endl;
+      GridGenerator::hyper_cube(tria, 0., 1.);
+      tria.refine_global(3 - dim);
+    }
+    tria.refine_global(1);
+    dof_handler.distribute_dofs(fe);
+    pout << "Number of degrees of freedom: " << dof_handler.n_dofs() << std::endl;
 
-        if (cycle == 0)
-        {
-            GridGenerator::hyper_cube(triangulation, 0., 1.);
-            triangulation.refine_global(3 - dim);
-        }
-        triangulation.refine_global(1);
-        // setup_system();
-        // assemble_rhs();
-        // solve();
-        // output_results(cycle);
-        pcout << std::endl;
+    constraints.clear();
+    constraints.reinit(dof_handler.locally_owned_dofs(), DoFTools::extract_locally_relevant_dofs(dof_handler));
+    DoFTools::make_zero_boundary_constraints(dof_handler, constraints);
+    constraints.close();
+    DoFRenumbering::support_point_wise(dof_handler);
+    
+    const auto test = [&](const std::string &label, const auto &op) {
+      (void)label;
+
+      // initialize vector
+      VectorType u, v;
+      op.initialize_dof_vector(u);
+      op.initialize_dof_vector(v);
+      u = 1.0;
+
+      constraints.set_zero(u);
+
+      // perform matrix-vector product
+      op.vmult(v, u);
+
+      // create solver
+      ReductionControl reduction_control(100, 1e-20, 1e-6);
+      // Modify the first argument for n_iter
+
+      // create preconditioner
+      DiagonalMatrix<VectorType> diagonal_matrix;
+      op.compute_inverse_diagonal(diagonal_matrix.get_vector());
+
+      std::chrono::time_point<std::chrono::system_clock> now;
+      try
+      {
+        // solve problem
+        SolverCG<VectorType> solver(reduction_control);
+        now = std::chrono::system_clock::now();
+        solver.solve(op, v, u, diagonal_matrix);
+      }
+      catch (const SolverControl::NoConvergence &)
+      {
+        pout << "Error: solver failed to converge with" << std::endl;
+      }
+      const auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - now).count() / 1e9;
+
+      pout << label << ": " << reduction_control.last_step() << " " << v.l2_norm() << " " 
+            << time << std::endl;
     };
+
+    // create and test the libCEED operator
+    OperatorCeed<dim, Number> op_ceed(mapping, dof_handler, constraints, quadrature, libCEED_resource);
+    test("ceed", op_ceed);
+
+    // create and test a native deal.II operator
+    OperatorDealii<dim, Number> op_dealii(mapping, dof_handler, constraints, quadrature);
+    test("dealii", op_dealii);
+    
+  };
 }
