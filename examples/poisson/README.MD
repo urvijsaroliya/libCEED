@@ -26,7 +26,7 @@ To run the executable, write:
 
 # Evaluations on AMD Ryzen Threadripper 2990WX 32-Core CPU
 | Cycle No. | No. of DoFs | No. of interations (CEED) | No. of interations (deal.ii) | CEED Operator - Runtime(s) | deal.ii Operator - Runtime(s) |
-|-|-|-|-|-|
+|-|-|-|-|-|-|
 | 0 | 125 | 4 | 4 | 0.000656872 | 0.00153963 |
 | 1 | 729 | 11 | 11 | 0.00187231 | 0.016047 |
 | 2 | 4913 | 22 | 22 | 0.0197677 | 0.234204 |
@@ -36,7 +36,7 @@ To run the executable, write:
 
 # Evaluations on NVIDIA A100-PCIE-40GB GPU
 | Cycle No. | No. of DoFs | No. of interations (CEED) | No. of interations (deal.ii) | CEED Operator - Runtime(s) | deal.ii Operator - Runtime(s) |
-|-|-|-|-|-|
+|-|-|-|-|-|-|
 | 0 | 125 | 4 | 4 | 0.00858444 | 0.00189128 |
 | 1 | 729 | 20 | 11 | 0.00374779 | 0.0154138 |
 | 2 | 4913 | 46 | 22 | 0.0231386 | 0.255538 |
