@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------
 
 #include <ceed.h>
+#include <deal.II/base/tensor.h>
 
 /**
  * Context passed to libCEED Q-function.
@@ -23,6 +24,67 @@
 struct BuildContext
 {
   CeedInt dim, space_dim;
+};
+
+template <int dim>
+class Evaluator
+{
+public:
+  Evaluator(const CeedInt Q, const CeedScalar *const *in, CeedScalar *const *out)
+    :
+    Q(Q),
+    in(in),
+    out(out)
+  {}
+
+  void compute(const CeedInt i)
+  {
+    dealii::Tensor<1, dim> grad = get_gradient(i);
+    submit_gradient(grad, i);
+    //CeedScalar val = get_value(i);
+    //submit_value(val, i);
+  }
+
+private:
+  dealii::Tensor<1, dim> get_gradient(const CeedInt i) const
+  {
+    const CeedScalar *ug = in[0];
+    dealii::Tensor<1, dim> output;
+    for (int d = 0; d < dim; ++d)
+      output[d] = ug[i + Q * d];
+    return output;
+  }
+
+  void submit_gradient(const dealii::Tensor<1, dim> input, const CeedInt i)
+  {
+    const CeedScalar *gdata = in[1];
+    CeedScalar *vg = out[0];
+    for (unsigned int d = 0; d < dim; ++d)
+      vg[i + d * Q] = input[d] * gdata[i + Q * d];
+    for (unsigned int d = 0, c = (dim * (dim + 1)) / 2 - 1; d < dim; ++d)
+      for (unsigned int e = d + 1; e < dim; ++e, --c)
+        {
+          vg[i + e * Q] += input[d] * gdata[i + Q * c];
+          vg[i + d * Q] += input[e] * gdata[i + Q * c];
+        }
+  }
+
+  CeedScalar get_value(const CeedInt i) const
+  {
+    const CeedScalar *uv = in[1];
+    return uv[i];
+  }
+
+  void submit_value(const CeedScalar input, const CeedInt i)
+  {
+    const CeedScalar *gdata = in[2];
+    CeedScalar *vv = out[1];
+    vv[i] = input * gdata[i + Q * dim * (dim + 1) / 2];
+  }
+
+  const CeedInt Q;
+  const CeedScalar *const * in;
+  CeedScalar *const *out;
 };
 
 /**
@@ -40,7 +102,8 @@ CEED_QFUNCTION(f_build_poisson)
       case 11:
         CeedPragmaSIMD for (CeedInt i = 0; i < Q; i++)
         {
-          qdata[i] = w[i] / J[i];
+          qdata[i + Q * 0] = w[i] / J[i];
+          //qdata[i + Q * 1] = w[i] * J[i];
         }
         break;
       case 22:
@@ -54,6 +117,7 @@ CEED_QFUNCTION(f_build_poisson)
           qdata[i + Q * 0]     = qw * (J12 * J12 + J22 * J22);
           qdata[i + Q * 1]     = qw * (J11 * J11 + J21 * J21);
           qdata[i + Q * 2]     = -qw * (J11 * J12 + J21 * J22);
+          //qdata[i + Q * 3]     = w[i] * (J11 * J22 - J21 * J12);
         }
         break;
       case 33:
@@ -84,6 +148,7 @@ CEED_QFUNCTION(f_build_poisson)
           qdata[i + Q * 3]     = qw * (A21 * A31 + A22 * A32 + A23 * A33);
           qdata[i + Q * 4]     = qw * (A11 * A31 + A12 * A32 + A13 * A33);
           qdata[i + Q * 5]     = qw * (A11 * A21 + A12 * A22 + A13 * A23);
+          //qdata[i + Q * 6]     = w[i] * (J11 * A11 + J21 * A12 + J31 * A13);
         }
         break;
     }
@@ -98,38 +163,71 @@ CEED_QFUNCTION(f_build_poisson)
 CEED_QFUNCTION(f_apply_poisson)
 (void *ctx, const CeedInt Q, const CeedScalar *const *in, CeedScalar *const *out)
 {
-  BuildContext     *bc = (BuildContext *)ctx;
-  const CeedScalar *ug = in[0], *qdata = in[1];
-  CeedScalar       *vg = out[0];
-
-  switch (bc->dim)
+  if (0)
     {
-      case 1:
-        CeedPragmaSIMD for (CeedInt i = 0; i < Q; i++)
+    BuildContext     *bc = (BuildContext *)ctx;
+    switch (bc->dim + 10 * bc->space_dim)
+      {
+        case 11:
+         {
+            Evaluator<1> evaluator(Q, in, out);
+            CeedPragmaSIMD for (CeedInt i = 0; i < Q; ++i)
+              evaluator.compute(i);
+         }
+         break;
+        case 22:
+         {
+             Evaluator<2> evaluator(Q, in, out);
+             CeedPragmaSIMD for (CeedInt i = 0; i < Q; ++i)
+                 evaluator.compute(i);
+         }
+         break;
+        case 33:
+         {
+             Evaluator<3> evaluator(Q, in, out);
+             CeedPragmaSIMD for (CeedInt i = 0; i < Q; ++i)
+                 evaluator.compute(i);
+         }
+         break;
+      default:
+        AssertThrow(false, dealii::ExcNotImplemented());
+      }
+    }
+  else
+    {
+      BuildContext     *bc = (BuildContext *)ctx;
+      const CeedScalar *ug = in[0], *qdata = in[1];
+      CeedScalar       *vg = out[0];
+
+      switch (bc->dim)
         {
-          vg[i] = ug[i] * qdata[i];
+        case 1:
+          CeedPragmaSIMD for (CeedInt i = 0; i < Q; i++)
+            {
+              vg[i] = ug[i] * qdata[i + Q * 0];
+            }
+          break;
+        case 2:
+          CeedPragmaSIMD for (CeedInt i = 0; i < Q; i++)
+            {
+              const CeedScalar ug0 = ug[i + Q * 0];
+              const CeedScalar ug1 = ug[i + Q * 1];
+              vg[i + Q * 0]        = qdata[i + Q * 0] * ug0 + qdata[i + Q * 2] * ug1;
+              vg[i + Q * 1]        = qdata[i + Q * 2] * ug0 + qdata[i + Q * 1] * ug1;
+            }
+          break;
+        case 3:
+          CeedPragmaSIMD for (CeedInt i = 0; i < Q; i++)
+            {
+              const CeedScalar ug0 = ug[i + Q * 0];
+              const CeedScalar ug1 = ug[i + Q * 1];
+              const CeedScalar ug2 = ug[i + Q * 2];
+              vg[i + Q * 0] = qdata[i + Q * 0] * ug0 + qdata[i + Q * 5] * ug1 + qdata[i + Q * 4] * ug2;
+              vg[i + Q * 1] = qdata[i + Q * 5] * ug0 + qdata[i + Q * 1] * ug1 + qdata[i + Q * 3] * ug2;
+              vg[i + Q * 2] = qdata[i + Q * 4] * ug0 + qdata[i + Q * 3] * ug1 + qdata[i + Q * 2] * ug2;
+            }
+          break;
         }
-        break;
-      case 2:
-        CeedPragmaSIMD for (CeedInt i = 0; i < Q; i++)
-        {
-          const CeedScalar ug0 = ug[i + Q * 0];
-          const CeedScalar ug1 = ug[i + Q * 1];
-          vg[i + Q * 0]        = qdata[i + Q * 0] * ug0 + qdata[i + Q * 2] * ug1;
-          vg[i + Q * 1]        = qdata[i + Q * 2] * ug0 + qdata[i + Q * 1] * ug1;
-        }
-        break;
-      case 3:
-        CeedPragmaSIMD for (CeedInt i = 0; i < Q; i++)
-        {
-          const CeedScalar ug0 = ug[i + Q * 0];
-          const CeedScalar ug1 = ug[i + Q * 1];
-          const CeedScalar ug2 = ug[i + Q * 2];
-          vg[i + Q * 0] = qdata[i + Q * 0] * ug0 + qdata[i + Q * 5] * ug1 + qdata[i + Q * 4] * ug2;
-          vg[i + Q * 1] = qdata[i + Q * 5] * ug0 + qdata[i + Q * 1] * ug1 + qdata[i + Q * 3] * ug2;
-          vg[i + Q * 2] = qdata[i + Q * 4] * ug0 + qdata[i + Q * 3] * ug1 + qdata[i + Q * 2] * ug2;
-        }
-        break;
     }
   return 0;
 }
