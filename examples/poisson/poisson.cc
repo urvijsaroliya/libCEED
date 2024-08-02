@@ -20,6 +20,7 @@
 #include <deal.II/matrix_free/matrix_free.h>
 #include <deal.II/matrix_free/operators.h>
 
+#include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/vector_tools.h>
 
 #include "poisson.h"
@@ -60,24 +61,20 @@ typedef dealii::VectorizedArray<double, 1> VectorizedArrayType;
 #define USE_SHMEM
 #define SHOW_VARIANTS
 
-template <typename OperatorType>
-class LaplaceOperatorMerged
+
+template <int dim>
+class QuadraticFunction : public Function<dim>
 {
 public:
-  LaplaceOperatorMerged(const OperatorType &op)
-    : op(op)
-  {}
-
-  template <typename VectorType>
-  void
-  vmult(VectorType &dst, const VectorType &src) const
+  virtual double value(const Point<dim> &p, const unsigned int) const override
   {
-    op.vmult_merged(dst, src);
+    double result = 0;
+    for (unsigned int d = 0; d < dim; ++d)
+      result += p[d] * p[d];
+    return result;
   }
-
-private:
-  const OperatorType &op;
 };
+
 
 template <int dim>
 void
@@ -120,16 +117,46 @@ test(const unsigned int fe_degree,
       (void)label;
 
       // initialize vector
-      VectorType u, v, result;
-      op.initialize_dof_vector(u);
-      op.initialize_dof_vector(v);
-      op.initialize_dof_vector(result);
-      u = 1.0;
+      VectorType u_exact, rhs, u_iterative;
+      op.initialize_dof_vector(u_exact);
+      op.initialize_dof_vector(rhs);
+      op.initialize_dof_vector(u_iterative);
+      VectorTools::interpolate(mapping, dof_handler, QuadraticFunction<dim>(), u_exact);
+      u_exact.update_ghost_values();
 
-      constraints.set_zero(u);
-
-      // perform matrix-vector product
-      op.vmult(v, u);
+      {
+        FEValues<dim> fe_values(mapping, fe_q, QGauss<dim>(fe_q.degree + 1),
+                                update_values | update_quadrature_points |
+                                update_JxW_values | update_gradients);
+        std::vector<types::global_dof_index> dof_indices(fe_q.dofs_per_cell);
+        Vector<double> local_vector(fe_q.dofs_per_cell);
+        std::vector<Tensor<1, dim>> grads_q_points(fe_values.n_quadrature_points);
+        for (const auto &cell : dof_handler.active_cell_iterators())
+          if (cell->is_locally_owned())
+            {
+              cell->get_dof_indices(dof_indices);
+              fe_values.reinit(cell);
+              std::fill(grads_q_points.begin(), grads_q_points.end(), Tensor<1, dim>());
+              for (unsigned int i = 0; i < fe_q.dofs_per_cell; ++i)
+                {
+                  double local_value = constraints.is_constrained(dof_indices[i]) ?
+                    u_exact(dof_indices[i]) : 0;
+                  for (const unsigned int q : fe_values.quadrature_point_indices())
+                    grads_q_points[q] += local_value * fe_values.shape_grad(i, q);
+                }
+              for (unsigned int i = 0; i < fe_q.dofs_per_cell; ++i)
+                {
+                  double sum = 0;
+                  for (const unsigned int q : fe_values.quadrature_point_indices())
+                    sum += (-fe_values.shape_grad(i, q) * grads_q_points[q]
+                            -
+                            fe_values.shape_value(i, q) * 2 * dim) * fe_values.JxW(q);
+                  local_vector[i] = sum;
+                }
+              constraints.distribute_local_to_global(local_vector, dof_indices, rhs);
+            }
+        rhs.compress(VectorOperation::add);
+      }
 
       // create solver
       ReductionControl reduction_control(100, 1e-20, 1e-6);
@@ -145,29 +172,47 @@ test(const unsigned int fe_degree,
         // solve problem
         SolverCG<VectorType> solver(reduction_control);
         now = std::chrono::system_clock::now();
-        solver.solve(op, result, v, diagonal_matrix);
+        solver.solve(op, u_iterative, rhs, diagonal_matrix);
       }
       catch (const SolverControl::NoConvergence &)
       {
         // std::cout << "Error: solver failed to converge with" << std::endl;
         std::cout << "";
       }
+
       const auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - now).count() / 1e9;
-      result -= u;
+      for (unsigned int i = 0; i < u_iterative.locally_owned_size(); ++i)
+        if (constraints.is_constrained(u_iterative.get_partitioner()->local_to_global(i)))
+          u_iterative.local_element(i) = u_exact.local_element(i);
+
+      if (false)
+        {
+          DataOut<dim> data_out;
+          data_out.attach_dof_handler(dof_handler);
+          data_out.add_data_vector(u_exact, "exact");
+          data_out.add_data_vector(u_iterative, "iterative");
+          DataOutBase::VtkFlags flags;
+          flags.write_higher_order_cells = true;
+          data_out.set_flags(flags);
+          data_out.build_patches(mapping, fe_q.degree);
+          std::ofstream file("output-" + std::to_string(s) + ".vtu");
+          data_out.write_vtu(file);
+        }
+
+      u_iterative -= u_exact;
 
       std::cout << std::setw(2) << fe_degree << " | " << std::setw(2) << n_q_points   //
               << " |" << std::setw(10) << tria->n_global_active_cells()             //
               << " |" << std::setw(11) << dof_handler.n_dofs()                      //
-                << " |" << std::setw(4) << reduction_control.last_step()
+              << " |" << std::setw(4) << reduction_control.last_step()
               << " | " << std::setw(11) << time / reduction_control.last_step() //
               << " | " << std::setw(11)
               << dof_handler.n_dofs() / time * reduction_control.last_step()
               << " | " << std::setw(11)
-              << result.l2_norm() / u.l2_norm() << std::endl;
+              << u_iterative.l2_norm() / u_exact.l2_norm() << std::endl;
       // std::cout
       //     << " p |  q | n_element |     n_dofs |     time/it |   dofs/s/it | mer_time/it | opt_time/it | itCG | time/matvec"
       //     << std::endl;
-
     };
 
     // create and test the libCEED operator

@@ -13,7 +13,7 @@ class MyManifold : public dealii::ChartManifold<dim, dim, dim>
 {
 public:
   MyManifold()
-    : factor(0.1)
+    : factor(1e-4)
   {}
 
   virtual std::unique_ptr<dealii::Manifold<dim>>
