@@ -97,7 +97,7 @@ test(const unsigned int fe_degree,
   Timer           time;
   MyManifold<dim> manifold;
 
-  const auto tria = create_triangulation(s, manifold, true);
+  const auto tria = create_triangulation(s, manifold, false);
 
   using Number = double;
   using VectorType = LinearAlgebra::distributed::Vector<Number>;
@@ -120,9 +120,10 @@ test(const unsigned int fe_degree,
       (void)label;
 
       // initialize vector
-      VectorType u, v;
+      VectorType u, v, result;
       op.initialize_dof_vector(u);
       op.initialize_dof_vector(v);
+      op.initialize_dof_vector(result);
       u = 1.0;
 
       constraints.set_zero(u);
@@ -144,7 +145,7 @@ test(const unsigned int fe_degree,
         // solve problem
         SolverCG<VectorType> solver(reduction_control);
         now = std::chrono::system_clock::now();
-        solver.solve(op, v, u, diagonal_matrix);
+        solver.solve(op, result, v, diagonal_matrix);
       }
       catch (const SolverControl::NoConvergence &)
       {
@@ -152,19 +153,21 @@ test(const unsigned int fe_degree,
         std::cout << "";
       }
       const auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - now).count() / 1e9;
+      result -= u;
 
       std::cout << std::setw(2) << fe_degree << " | " << std::setw(2) << n_q_points   //
               << " |" << std::setw(10) << tria->n_global_active_cells()             //
               << " |" << std::setw(11) << dof_handler.n_dofs()                      //
+                << " |" << std::setw(4) << reduction_control.last_step()
               << " | " << std::setw(11) << time / reduction_control.last_step() //
               << " | " << std::setw(11)
-              << dof_handler.n_dofs() / time * reduction_control.last_step() 
+              << dof_handler.n_dofs() / time * reduction_control.last_step()
               << " | " << std::setw(11)
-              << v.l2_norm() << std::endl;
+              << result.l2_norm() / u.l2_norm() << std::endl;
       // std::cout
       //     << " p |  q | n_element |     n_dofs |     time/it |   dofs/s/it | mer_time/it | opt_time/it | itCG | time/matvec"
       //     << std::endl;
-      
+
     };
 
     // create and test the libCEED operator
@@ -194,7 +197,7 @@ do_test(const unsigned int fe_degree, const int s_in)
                  static_cast<unsigned int>(std::log2(1024 / fe_degree / fe_degree / fe_degree)));
       if (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
       std::cout
-          << " p |  q | n_element |     n_dofs |     time/it |   dofs/s/it |   l2_norm"
+          << " p |  q | n_element |     n_dofs | #it |     time/it |   dofs/s/it |   l2_error"
           << std::endl;
       while ((2 + Utilities::fixed_power<dim>(fe_degree + 1)) * (1UL << (s / 4)) <
              6000000ULL * Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD))
