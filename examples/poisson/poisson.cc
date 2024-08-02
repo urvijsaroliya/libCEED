@@ -1,101 +1,122 @@
-// ---------------------------------------------------------------------
-//
-// Copyright (C) 2023 by the deal.II authors
-//
-// This file is part of the deal.II library.
-//
-// The deal.II library is free software; you can use it, redistribute
-// it, and/or modify it under the terms of the GNU Lesser General
-// Public License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-// The full text of the license can be found in the file LICENSE.md at
-// the top level directory of deal.II.
-//
-//  Authors: Peter Munch, Martin Kronbichler
-//
-// ---------------------------------------------------------------------
 
-// deal.II includes
-#include <deal.II/base/conditional_ostream.h>
-#include <deal.II/base/mpi.h>
-#include <deal.II/base/parameter_handler.h>
-#include <deal.II/base/quadrature_lib.h>
+#include <deal.II/base/timer.h>
 
-#include <deal.II/distributed/shared_tria.h>
 #include <deal.II/distributed/tria.h>
 
-#include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_renumbering.h>
 
-#include <deal.II/fe/fe_nothing.h>
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_system.h>
-#include <deal.II/fe/fe_tools.h>
-#include <deal.II/fe/fe_values.h>
-#include <deal.II/fe/mapping_q1.h>
+
+#include <deal.II/grid/grid_generator.h>
+#include <deal.II/grid/grid_tools.h>
+
+#include <deal.II/lac/la_parallel_block_vector.h>
+#include <deal.II/lac/precondition.h>
+#include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/solver_control.h>
+
+#include <deal.II/matrix_free/fe_evaluation.h>
+#include <deal.II/matrix_free/matrix_free.h>
+#include <deal.II/matrix_free/operators.h>
 
 #include <deal.II/numerics/vector_tools.h>
 
-#include <deal.II/grid/grid_generator.h>
-
-#include <deal.II/lac/affine_constraints.h>
-#include <deal.II/lac/precondition.h>
-#include <deal.II/lac/solver_cg.h>
-
-// boost
-#include <boost/algorithm/string.hpp>
-
-#include <sstream>
-
-// include operators
 #include "poisson.h"
 
-int main(int argc, char *argv[])
-{
-  Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
-  ConditionalOStream pout(std::cout, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0);
+// #define USE_STD_SIMD
 
-  // Init parameters
-  using Number                     = double;
-  using VectorType                 = LinearAlgebra::distributed::Vector<Number>;
-  const unsigned int dim           = 3;
-  const unsigned int fe_degree     = 2;
-  const unsigned int n_q_points    = fe_degree + 1;
-  const unsigned int n_components  = 1;
-  std::string  libCEED_resource    = "/cpu/self/avx/blocked";
-
-#ifdef DEAL_II_WITH_P4EST
-  parallel::distributed::Triangulation<dim> tria(MPI_COMM_WORLD);
-#else
-  parallel::shared::Triangulation<dim> tria(MPI_COMM_WORLD, ::Triangulation<dim>::none, true);
+#ifdef USE_STD_SIMD
+#  include <experimental/simd>
 #endif
 
-  // create mapping, quadrature, fe, mesh, ...
-  MappingQ1<dim> mapping;
+#ifdef LIKWID_PERFMON
+#  include <likwid.h>
+#endif
+
+#include "common_code/curved_manifold.h"
+
+using namespace dealii;
+
+#include "common_code/create_triangulation.h"
+
+// VERSION:
+//   0: p:d:t + vectorized over elements;
+//   1: p:f:t + vectorized within element (not optimized)
+#define VERSION 0
+
+#if VERSION == 0
+
+#  ifdef USE_STD_SIMD
+typedef std::experimental::native_simd<double> VectorizedArrayType;
+#  else
+typedef dealii::VectorizedArray<double> VectorizedArrayType;
+#  endif
+
+#elif VERSION == 1
+typedef dealii::VectorizedArray<double, 1> VectorizedArrayType;
+#endif
+
+#define USE_SHMEM
+#define SHOW_VARIANTS
+
+template <typename OperatorType>
+class LaplaceOperatorMerged
+{
+public:
+  LaplaceOperatorMerged(const OperatorType &op)
+    : op(op)
+  {}
+
+  template <typename VectorType>
+  void
+  vmult(VectorType &dst, const VectorType &src) const
+  {
+    op.vmult_merged(dst, src);
+  }
+
+private:
+  const OperatorType &op;
+};
+
+template <int dim>
+void
+test(const unsigned int fe_degree,
+     const unsigned int s,
+     const MPI_Comm    &comm_shmem)
+{
+#ifndef USE_SHMEM
+  (void)comm_shmem;
+#endif
+
+  warmup_code();
+  const unsigned int n_q_points = fe_degree + 1;
+
+  deallog.depth_console(0);
+
+  Timer           time;
+  MyManifold<dim> manifold;
+
+  const auto tria = create_triangulation(s, manifold, true);
+
+  using Number = double;
+  using VectorType = LinearAlgebra::distributed::Vector<Number>;
+  // std::string  libCEED_resource = "/gpu/cuda/ref";
+  std::string  libCEED_resource = "/cpu/self/ref/blocked";
+  FE_Q<dim>            fe_q(fe_degree);
+  MappingQGeneric<dim> mapping(1); // tri-linear mapping
+  DoFHandler<dim>      dof_handler(*tria);
   QGauss<dim>    quadrature(n_q_points);
-  FESystem<dim>  fe(FE_Q<dim>(fe_degree), n_components);
-  DoFHandler<dim> dof_handler(tria);
   AffineConstraints<Number> constraints;
 
-  for (unsigned int cycle = 0; cycle < 9 - dim; ++cycle)
-  {
-    pout << "Cycle " << cycle << std::endl;
-    if (cycle == 0)
-    {
-      GridGenerator::hyper_cube(tria, 0., 1.);
-      tria.refine_global(3 - dim);
-    }
-    tria.refine_global(1);
-    dof_handler.distribute_dofs(fe);
-    pout << "Number of degrees of freedom: " << dof_handler.n_dofs() << std::endl;
+  dof_handler.distribute_dofs(fe_q);
+  constraints.clear();
+  constraints.reinit(dof_handler.locally_owned_dofs(), DoFTools::extract_locally_relevant_dofs(dof_handler));
+  DoFTools::make_zero_boundary_constraints(dof_handler, constraints);
+  constraints.close();
+  DoFRenumbering::support_point_wise(dof_handler);
 
-    constraints.clear();
-    constraints.reinit(dof_handler.locally_owned_dofs(), DoFTools::extract_locally_relevant_dofs(dof_handler));
-    DoFTools::make_zero_boundary_constraints(dof_handler, constraints);
-    constraints.close();
-    DoFRenumbering::support_point_wise(dof_handler);
-    
-    const auto test = [&](const std::string &label, const auto &op) {
+  const auto test_ceed = [&](const std::string &label, const auto &op) {
       (void)label;
 
       // initialize vector
@@ -127,21 +148,95 @@ int main(int argc, char *argv[])
       }
       catch (const SolverControl::NoConvergence &)
       {
-        pout << "Error: solver failed to converge with" << std::endl;
+        // std::cout << "Error: solver failed to converge with" << std::endl;
+        std::cout << "";
       }
       const auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - now).count() / 1e9;
 
-      pout << label << ": " << reduction_control.last_step() << " " << v.l2_norm() << " " 
-            << time << std::endl;
+      std::cout << std::setw(2) << fe_degree << " | " << std::setw(2) << n_q_points   //
+              << " |" << std::setw(10) << tria->n_global_active_cells()             //
+              << " |" << std::setw(11) << dof_handler.n_dofs()                      //
+              << " | " << std::setw(11) << time / reduction_control.last_step() //
+              << " | " << std::setw(11)
+              << dof_handler.n_dofs() / time * reduction_control.last_step() 
+              << " | " << std::setw(11)
+              << v.l2_norm() << std::endl;
+      // std::cout
+      //     << " p |  q | n_element |     n_dofs |     time/it |   dofs/s/it | mer_time/it | opt_time/it | itCG | time/matvec"
+      //     << std::endl;
+      
     };
 
     // create and test the libCEED operator
     OperatorCeed<dim, Number> op_ceed(mapping, dof_handler, constraints, quadrature, libCEED_resource);
-    test("ceed", op_ceed);
+    test_ceed("ceed", op_ceed);
+}
 
-    // create and test a native deal.II operator
-    OperatorDealii<dim, Number> op_dealii(mapping, dof_handler, constraints, quadrature);
-    test("dealii", op_dealii);
-    
-  };
+
+template <int dim>
+void
+do_test(const unsigned int fe_degree, const int s_in)
+{
+  MPI_Comm comm_shmem = MPI_COMM_SELF;
+
+#ifdef USE_SHMEM
+  MPI_Comm_split_type(MPI_COMM_WORLD,
+                      MPI_COMM_TYPE_SHARED,
+                      Utilities::MPI::this_mpi_process(MPI_COMM_WORLD),
+                      MPI_INFO_NULL,
+                      &comm_shmem);
+#endif
+
+  if (s_in < 1)
+    {
+      unsigned int s =
+        std::max(3U,
+                 static_cast<unsigned int>(std::log2(1024 / fe_degree / fe_degree / fe_degree)));
+      if (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+      std::cout
+          << " p |  q | n_element |     n_dofs |     time/it |   dofs/s/it |   l2_norm"
+          << std::endl;
+      while ((2 + Utilities::fixed_power<dim>(fe_degree + 1)) * (1UL << (s / 4)) <
+             6000000ULL * Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD))
+        {
+          test<dim>(fe_degree, s, comm_shmem);
+          ++s;
+        }
+      if (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+        std::cout << std::endl << std::endl;
+    }
+  else
+    test<dim>(fe_degree, s_in, comm_shmem);
+
+#ifdef USE_SHMEM
+  MPI_Comm_free(&comm_shmem);
+#endif
+}
+
+
+int
+main(int argc, char **argv)
+{
+#ifdef LIKWID_PERFMON
+  LIKWID_MARKER_INIT;
+  LIKWID_MARKER_THREADINIT;
+#endif
+
+  Utilities::MPI::MPI_InitFinalize mpi(argc, argv, 1);
+
+  unsigned int degree         = 1;
+  unsigned int s              = -1;
+  bool         compact_output = true;
+  if (argc > 1)
+    degree = std::atoi(argv[1]);
+  if (argc > 2)
+    s = std::atoi(argv[2]);
+
+  do_test<3>(degree, s);
+
+#ifdef LIKWID_PERFMON
+  LIKWID_MARKER_CLOSE;
+#endif
+
+  return 0;
 }
